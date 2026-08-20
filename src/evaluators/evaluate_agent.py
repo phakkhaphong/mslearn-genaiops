@@ -10,10 +10,13 @@ Runs the full evaluation pipeline:
 Evaluates: Intent Resolution, Relevance, and Groundedness
 """
 
+import argparse
 import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
 from dotenv import load_dotenv
 from azure.identity import DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
@@ -39,23 +42,15 @@ dataset_version       = "1"
 # can read it and post results as a PR comment — no re-running needed.
 RESULTS_FILE = Path("evaluation_results.txt")
 
-if not endpoint:
-    print("ERROR: AZURE_AI_PROJECT_ENDPOINT is not set.")
-    print("       Add it to your .env file and try again.")
-    sys.exit(1)
+# How long to keep retrying 404s right after create (Foundry can take a
+# few seconds before GET /runs/{id} becomes consistent).
+NOT_FOUND_RETRY_SECONDS = 180
+POLL_INTERVAL_SECONDS = 10
 
-# ---------------------------------------------------------------------------
-# Azure clients
-# ---------------------------------------------------------------------------
-
-# AIProjectClient connects to your Azure AI Foundry project
-project_client = AIProjectClient(
-    endpoint=endpoint,
-    credential=DefaultAzureCredential(),
-)
-
-# The OpenAI-compatible client exposes the Evals API
-client = project_client.get_openai_client()
+# Lazily initialized in init_clients() so unit tests can import this module
+# without talking to Azure.
+project_client = None
+client = None
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +62,134 @@ def section(title: str) -> None:
     print(f"\n{'=' * 80}")
     print(f"{title}")
     print(f"{'=' * 80}")
+
+
+def init_clients() -> None:
+    """Create Foundry / OpenAI clients. Exits if the project endpoint is missing."""
+    global project_client, client
+    if client is not None:
+        return
+
+    if not endpoint:
+        print("ERROR: AZURE_AI_PROJECT_ENDPOINT is not set.")
+        print("       Add it to your .env file and try again.")
+        sys.exit(1)
+
+    project_client = AIProjectClient(
+        endpoint=endpoint,
+        credential=DefaultAzureCredential(),
+    )
+    client = project_client.get_openai_client()
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """Parse CLI flags used to resume an in-flight cloud evaluation run.
+
+    Args:
+        argv: Optional argument list. Defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Parsed arguments. ``eval_id`` / ``run_id`` may be None when starting
+        a new evaluation.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run or resume Trail Guide Agent cloud evaluation.",
+    )
+    parser.add_argument(
+        "--eval-id",
+        default=os.environ.get("EVAL_ID"),
+        help="Existing evaluation definition ID (skip create; resume polling).",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=os.environ.get("EVAL_RUN_ID"),
+        help="Existing evaluation run ID (skip create; resume polling).",
+    )
+    return parser.parse_args(argv)
+
+
+def is_not_found(exc: Exception) -> bool:
+    """Return True when the exception is an HTTP 404 / resource-not-found error.
+
+    Args:
+        exc: Exception raised by the OpenAI-compatible client.
+
+    Returns:
+        True if the error should be retried as a transient visibility lag.
+    """
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    message = str(exc).lower()
+    return "not found" in message or "notfound" in message
+
+
+def resume_command(eval_id: str, run_id: str) -> str:
+    """Return the command used to resume polling a live cloud run.
+
+    Args:
+        eval_id: Evaluation definition ID.
+        run_id: Evaluation run ID.
+
+    Returns:
+        Shell command string.
+    """
+    return (
+        "python src/evaluators/evaluate_agent.py "
+        f"--eval-id {eval_id} --run-id {run_id}"
+    )
+
+
+def write_in_progress(eval_id: str, run_id: str) -> None:
+    """Persist resume IDs so a local crash does not look like a finished eval.
+
+    Args:
+        eval_id: Evaluation definition ID.
+        run_id: Evaluation run ID.
+    """
+    RESULTS_FILE.write_text(
+        "\n".join(
+            [
+                "=" * 80,
+                " Trail Guide Agent - Evaluation IN PROGRESS",
+                "=" * 80,
+                "",
+                f"  Eval ID : {eval_id}",
+                f"  Run ID  : {run_id}",
+                "",
+                "Cloud scoring is still running. This file is not the final scorecard.",
+                "Resume polling (do not start a new evaluation):",
+                f"  {resume_command(eval_id, run_id)}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def fetch_eval_run(openai_client, eval_id: str, run_id: str):
+    """Fetch a run, falling back to list() when retrieve returns 404.
+
+    Args:
+        openai_client: OpenAI-compatible Foundry client.
+        eval_id: Evaluation definition ID.
+        run_id: Evaluation run ID.
+
+    Returns:
+        The matching run object.
+
+    Raises:
+        Exception: Re-raised when retrieve fails for a non-404 reason, or when
+            both retrieve and list cannot see the run yet.
+    """
+    try:
+        return openai_client.evals.runs.retrieve(run_id=run_id, eval_id=eval_id)
+    except Exception as exc:
+        if not is_not_found(exc):
+            raise
+        for run in openai_client.evals.runs.list(eval_id=eval_id):
+            if getattr(run, "id", None) == run_id:
+                return run
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -242,29 +365,66 @@ def run_evaluation(eval_object, data_id):
 # Step 4 – Poll until the run finishes
 # ---------------------------------------------------------------------------
 
-def poll_for_results(eval_object, eval_run):
-    """
-    Repeatedly check the run status every 10 seconds until it is 'completed'.
+def poll_for_results(
+    eval_object,
+    eval_run,
+    openai_client=None,
+    sleep_fn=time.sleep,
+    poll_interval=POLL_INTERVAL_SECONDS,
+    not_found_retry_seconds=NOT_FOUND_RETRY_SECONDS,
+):
+    """Poll until the cloud run reaches a terminal status.
 
-    Returns the final run object (which contains the report URL and results).
-    Exits with code 1 if the run fails so CI pipelines surface the error.
+    Foundry sometimes returns 404 ``Project not found`` on the first GET after
+    create even though the run is already queued. Retry those 404s and fall
+    back to ``runs.list`` instead of treating the local poll error as a failed
+    evaluation.
+
+    Args:
+        eval_object: Evaluation definition (needs ``id``).
+        eval_run: Evaluation run (needs ``id``).
+        openai_client: OpenAI-compatible client. Defaults to the module client.
+        sleep_fn: Sleep callable; injectable for tests.
+        poll_interval: Seconds between polls.
+        not_found_retry_seconds: How long to retry 404s before giving up.
+
+    Returns:
+        The final run object (contains report URL and aggregate counts).
+
+    Raises:
+        RuntimeError: If the cloud run fails/cancels, or 404s persist too long.
     """
     section("Step 4: Polling for completion")
-
+    openai_client = openai_client or client
     start_time = time.time()
+
     while True:
-        run = client.evals.runs.retrieve(
-            run_id=eval_run.id,
-            eval_id=eval_object.id,
-        )
-
         elapsed = int(time.time() - start_time)
+        try:
+            run = fetch_eval_run(openai_client, eval_object.id, eval_run.id)
+        except Exception as exc:
+            if is_not_found(exc) and elapsed < not_found_retry_seconds:
+                print(
+                    f"  [{elapsed}s] Status: waiting (run not visible yet, retrying)",
+                    end="\r",
+                    flush=True,
+                )
+                sleep_fn(poll_interval)
+                continue
+            raise RuntimeError(
+                f"Could not poll evaluation run after {elapsed}s.\n"
+                f"  Eval ID : {eval_object.id}\n"
+                f"  Run ID  : {eval_run.id}\n"
+                f"  Error   : {exc}\n"
+                f"  The cloud run may still be scoring. Resume with:\n"
+                f"  {resume_command(eval_object.id, eval_run.id)}"
+            ) from exc
 
-        if run.status == "completed":
+        status = getattr(run, "status", None)
+        if status == "completed":
             print(f"\n\n✓ Evaluation completed in {elapsed} seconds")
-            break
-        elif run.status == "failed":
-            # Raise so main() catches it, writes RESULTS_FILE, then exits
+            return run
+        if status == "failed":
             error_detail = getattr(run, "error", None) or "No additional details available."
             raise RuntimeError(
                 f"Evaluation run failed after {elapsed}s.\n"
@@ -273,12 +433,15 @@ def poll_for_results(eval_object, eval_run):
                 f"  Error   : {error_detail}\n"
                 f"  To inspect: open Azure AI Foundry portal > Evaluations"
             )
-        else:
-            # Overwrite the same line so the terminal isn't flooded
-            print(f"  [{elapsed}s] Status: {run.status}", end="\r", flush=True)
-            time.sleep(10)
+        if status in {"canceled", "cancelled"}:
+            raise RuntimeError(
+                f"Evaluation run was canceled after {elapsed}s.\n"
+                f"  Eval ID : {eval_object.id}\n"
+                f"  Run ID  : {eval_run.id}"
+            )
 
-    return run
+        print(f"  [{elapsed}s] Status: {status}", end="\r", flush=True)
+        sleep_fn(poll_interval)
 
 
 # ---------------------------------------------------------------------------
@@ -404,20 +567,45 @@ def retrieve_and_display_results(eval_object, run):
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    """Orchestrate the full evaluation pipeline step by step."""
+def main(argv=None) -> None:
+    """Orchestrate the full evaluation pipeline, or resume an existing run.
+
+    Args:
+        argv: Optional CLI arguments. Defaults to ``sys.argv[1:]``.
+    """
+    args = parse_args(argv)
+    resume = bool(args.eval_id or args.run_id)
+    if resume and not (args.eval_id and args.run_id):
+        print("ERROR: --eval-id and --run-id must be provided together to resume.")
+        sys.exit(2)
+
+    init_clients()
+
     section(" Trail Guide Agent - Cloud Evaluation")
     print(f"\nConfiguration:")
     print(f"  Project: {endpoint}")
     print(f"  Model:   {model_deployment_name}")
     print(f"  Dataset: {dataset_name} (v{dataset_version})")
+    if resume:
+        print(f"  Mode:    resume")
+        print(f"  Eval ID: {args.eval_id}")
+        print(f"  Run ID:  {args.run_id}")
 
+    eval_object = None
+    eval_run = None
     try:
-        data_id     = upload_dataset()                          # Step 1
-        eval_object = create_evaluation_definition()            # Step 2
-        eval_run    = run_evaluation(eval_object, data_id)      # Step 3
-        run         = poll_for_results(eval_object, eval_run)   # Step 4
-        retrieve_and_display_results(eval_object, run)          # Step 5
+        if resume:
+            eval_object = SimpleNamespace(id=args.eval_id)
+            eval_run = SimpleNamespace(id=args.run_id)
+            write_in_progress(eval_object.id, eval_run.id)
+        else:
+            data_id = upload_dataset()
+            eval_object = create_evaluation_definition()
+            eval_run = run_evaluation(eval_object, data_id)
+            write_in_progress(eval_object.id, eval_run.id)
+
+        run = poll_for_results(eval_object, eval_run)
+        retrieve_and_display_results(eval_object, run)
 
         section("Cloud evaluation complete")
         print(f"\nNext steps:")
@@ -425,6 +613,14 @@ def main() -> None:
         print(f"  2. Analyze patterns in successful and failed evaluations")
         print(f"  3. Commit {RESULTS_FILE} and push so the PR workflow can use it")
 
+    except KeyboardInterrupt:
+        if eval_object and eval_run:
+            write_in_progress(eval_object.id, eval_run.id)
+            print(
+                "\nInterrupted. Cloud evaluation is still running.\n"
+                f"Resume with:\n  {resume_command(eval_object.id, eval_run.id)}"
+            )
+        sys.exit(130)
     except Exception as e:
         error_message = (
             f"{'=' * 80}\n"
@@ -437,10 +633,15 @@ def main() -> None:
             f"  - Ensure GPT-5.1 model is deployed and accessible\n"
             f"  - Ensure the caller has Foundry User access at the AI account scope\n"
             f"  - If you just ran azd up, wait 1-2 minutes for role propagation and retry once\n"
+            f"  - If a Run ID was printed, resume polling instead of starting a new evaluation\n"
         )
         print(error_message)
-        # Write the error to the results file so it's never left empty
-        RESULTS_FILE.write_text(error_message, encoding="utf-8")
+        # Do not overwrite an in-progress marker with FAILED while we still
+        # have live IDs — the cloud job may still be scoring.
+        if eval_object and eval_run and "still be scoring" in str(e):
+            write_in_progress(eval_object.id, eval_run.id)
+        else:
+            RESULTS_FILE.write_text(error_message, encoding="utf-8")
         sys.exit(1)
 
 
