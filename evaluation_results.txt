@@ -1,15 +1,12 @@
 ================================================================================
- Trail Guide Agent - Evaluation Results
+ Trail Guide Agent - Evaluation FAILED
 ================================================================================
 
-  Eval ID      : eval_7c4c645fbe2c4e9e83d2c1b3af300106
-  Run ID       : evalrun_97c6ed6859324fc0bb01dce5df3ecb75
-  Total items  : 89
-  Errored items: 0
-  Scored items : 89
+Error: Error code: 404 - {'error': {'code': 'NotFound', 'message': 'Project not found'}}
 
-Average Scores (1-5 scale, threshold: 3)
-  No scores returned — open Azure AI Foundry portal > Evaluations for details.
-
-Pass Rates (score >= 3)
-  No scores returned.
+Troubleshooting:
+  - Verify AZURE_AI_PROJECT_ENDPOINT in .env file
+  - Check Azure credentials: az login
+  - Ensure GPT-5.1 model is deployed and accessible
+  - Ensure the caller has Foundry User access at the AI account scope
+  - If you just ran azd up, wait 1-2 minutes for role propagation and retry once
